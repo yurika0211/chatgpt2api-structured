@@ -10,6 +10,7 @@ from services.protocol.chat_completion_cache import cache_key, chat_completion_c
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
+    collect_text,
     count_message_image_tokens,
     count_message_text_tokens,
     count_text_tokens,
@@ -18,6 +19,13 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
     stream_text_deltas,
     text_backend,
+)
+from services.protocol.structured_output import (
+    normalize_structured_output,
+    reject_streaming_structured_output,
+    response_format_from_body,
+    structured_output_system_message,
+    validate_response_format,
 )
 from utils.helper import extract_image_from_message_content, extract_response_prompt, has_response_image_generation_tool
 from utils.image_tokens import (
@@ -236,9 +244,33 @@ def response_completed(
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
     messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
+    prefix_messages: list[dict[str, Any]] = []
+    response_format = response_format_from_body(body)
+    validate_response_format(response_format)
+    structured_message = structured_output_system_message(response_format)
+    if structured_message:
+        prefix_messages.append(structured_message)
     if has_non_image_tools(body):
-        messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
-    return model, messages
+        prefix_messages.append({"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
+    return model, [*prefix_messages, *messages]
+
+
+def text_response(body: dict[str, Any], model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    created = int(time.time())
+    response_id = f"resp_{uuid.uuid4().hex}"
+    content = collect_text(text_backend(), ConversationRequest(model=model, messages=messages))
+    try:
+        content = normalize_structured_output(content, response_format_from_body(body))
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+    item = text_output_item(content)
+    usage = token_usage(
+        input_text_tokens=count_message_text_tokens(messages, model),
+        input_image_tokens=count_message_image_tokens(messages, model),
+        output_text_tokens=count_text_tokens(content, model),
+    )
+    completed = response_completed(response_id, model, created, [item], usage)
+    return completed["response"]
 
 
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
@@ -318,6 +350,7 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if is_text_response_request(body):
+        reject_streaming_structured_output(body)
         model, messages = text_response_parts(body)
         key = cache_key(body, messages, stream=bool(body.get("stream")))
         yield from chat_completion_cache.get_or_compute_stream(
@@ -350,6 +383,15 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+    if is_text_response_request(body):
+        reject_streaming_structured_output(body)
+    if is_text_response_request(body) and not body.get("stream"):
+        model, messages = text_response_parts(body)
+        key = cache_key(body, messages, stream=False)
+        return chat_completion_cache.get_or_compute_response(
+            key,
+            lambda: text_response(body, model, messages),
+        )
     events = response_events(body)
     if body.get("stream"):
         return events
