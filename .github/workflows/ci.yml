@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CHATGPT2API_AUTH_KEY: ci-test-key
+      CHATGPT2API_BASE_URL: http://localhost:3000
+      STORAGE_BACKEND: json
+      UV_LINK_MODE: copy
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Compile Python sources
+        run: |
+          uv run python -m py_compile \
+            services/protocol/structured_output.py \
+            services/protocol/openai_v1_chat_complete.py \
+            services/protocol/openai_v1_response.py \
+            test/test_structured_output.py
+
+      - name: Run unit tests
+        run: uv run python -m unittest test.test_structured_output
+
+      - name: Validate Docker Compose config
+        run: docker compose config
